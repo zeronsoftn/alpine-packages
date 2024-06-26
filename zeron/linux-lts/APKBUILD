@@ -243,10 +243,6 @@ _package() {
 	install -D -m644 include/config/kernel.release \
 		"$_outdir"/usr/share/kernel/$_buildflavor/kernel.release
 	
-	if [ -n "${BUILD_LINUX_SIGN_COMMAND:-}" ]; then
-		${BUILD_LINUX_SIGN_COMMAND} "$_outdir"/boot/vmlinuz-$_abi_release
-	fi
-
 	case "$CARCH" in
 	loongarch64)
 		mv  "$_outdir"/boot/vmlinuz-$_abi_release \
@@ -259,6 +255,10 @@ _package() {
 			"$_outdir"/boot/System.map-$_buildflavor
 		;;
 	esac
+	
+	if [ -n "${BUILD_LINUX_SIGN_COMMAND:-}" ]; then
+		${BUILD_LINUX_SIGN_COMMAND} "$_outdir"/boot/vmlinuz-$_buildflavor
+	fi
 }
 
 # main flavor installs in $pkgdir
