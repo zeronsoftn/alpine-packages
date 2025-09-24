@@ -250,6 +250,10 @@ _package() {
 			"$_outdir"/boot/System.map-$_buildflavor
 		;;
 	esac
+	
+	if [ -n "${BUILD_LINUX_SIGN_COMMAND:-}" ]; then
+		${BUILD_LINUX_SIGN_COMMAND} "$_outdir"/boot/vmlinuz-$_buildflavor
+	fi
 }
 
 # main flavor installs in $pkgdir
