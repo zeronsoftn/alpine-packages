@@ -2,12 +2,9 @@
 
 _flavor=lts
 pkgname=linux-$_flavor
-pkgver=6.6.34
-case $pkgver in
-	*.*.*)	_kernver=${pkgver%.*};;
-	*.*) _kernver=$pkgver;;
-esac
-pkgrel=2
+pkgver=6.12.48
+_kernver=${pkgver%.*}
+pkgrel=0
 pkgdesc="Linux lts kernel"
 url="https://www.kernel.org"
 depends="initramfs-generator"
@@ -22,18 +19,16 @@ source="https://cdn.kernel.org/pub/linux/kernel/v${pkgver%%.*}.x/linux-$_kernver
 	0003-kexec-add-kexec_load_disabled-boot-option.patch
 	0004-objtool-respect-AWK-setting.patch
 	0005-powerpc-config-defang-gcc-check-for-stack-protector-.patch
-	0006-arm64-add-kernel-config-option-to-lock-down-when.patch
-	0007-efi-add-an-efi_secure_boot-flag-to-indicate-secure-b.patch
-	0008-efi-lock-down-the-kernel-if-booted-in-secure-boot-mo.patch
-	0009-mtd-disable-slram-and-phram-when-locked-down.patch
+	0007-libbpf-gcc15.patch
 
 	lts.aarch64.config
 	lts.armv7.config
+	lts.loongarch64.config
+	lts.ppc64le.config
+	lts.riscv64.config
+	lts.s390x.config
 	lts.x86.config
 	lts.x86_64.config
-	lts.ppc64le.config
-	lts.s390x.config
-	lts.loongarch64.config
 
 	virt.aarch64.config
 	virt.armv7.config
@@ -56,10 +51,10 @@ done
 builddir="$srcdir"/linux-$_kernver
 
 if [ "${pkgver%.0}" = "$pkgver" ]; then
-	source="$source
-	https://cdn.kernel.org/pub/linux/kernel/v${pkgver%%.*}.x/patch-$pkgver.xz"
+	# Prepend to apply first
+	source="patch-$pkgver.patch.xz::https://cdn.kernel.org/pub/linux/kernel/v${pkgver%%.*}.x/patch-$pkgver.xz $source"
 fi
-arch="all !armhf !riscv64"
+arch="all !armhf"
 license="GPL-2.0-only"
 
 # secfixes:
@@ -78,11 +73,6 @@ license="GPL-2.0-only"
 #     - CVE-46838
 
 prepare() {
-	if [ "$_kernver" != "$pkgver" ]; then
-		msg "Applying patch-$pkgver.xz"
-		unxz -c < "$srcdir"/patch-$pkgver.xz | patch -p1 -N
-	fi
-
 	default_prepare
 
 	# remove localversion from patch if any
@@ -182,12 +172,17 @@ updateconfigs() {
 	done
 }
 
+set_kbuild_timestamp() {
+	# KBUILD_BUILD_TIMESTAMP needs to be parsable by busybox date
+	export KBUILD_BUILD_TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S' -u${SOURCE_DATE_EPOCH:+d @$SOURCE_DATE_EPOCH})"
+}
+
 build() {
 	unset LDFLAGS
 	# for some reason these sometimes leak into the kernel build,
 	# -Werror=format-security breaks some stuff
 	unset CFLAGS CPPFLAGS CXXFLAGS
-	export KBUILD_BUILD_TIMESTAMP="$(date -Ru${SOURCE_DATE_EPOCH:+d @$SOURCE_DATE_EPOCH})"
+	set_kbuild_timestamp
 	for i in $_flavors; do
 		_prepareconfig "$i" "$CARCH"
 	done
@@ -211,7 +206,7 @@ build() {
 
 _package() {
 	local _buildflavor="$1" _outdir="$2"
-	export KBUILD_BUILD_TIMESTAMP="$(date -Ru${SOURCE_DATE_EPOCH:+d @$SOURCE_DATE_EPOCH})"
+	set_kbuild_timestamp
 
 	cd "$srcdir"/build-$_buildflavor.$CARCH
 	local _abi_release="$(make -s kernelrelease)"
@@ -242,7 +237,7 @@ _package() {
 
 	install -D -m644 include/config/kernel.release \
 		"$_outdir"/usr/share/kernel/$_buildflavor/kernel.release
-	
+
 	case "$CARCH" in
 	loongarch64)
 		mv  "$_outdir"/boot/vmlinuz-$_abi_release \
@@ -291,6 +286,7 @@ _dev() {
 	local _flavor=$(echo $subpkgname | sed -E 's/(^linux-|-dev$)//g')
 	local _builddir="$srcdir"/build-$_flavor.$CARCH
 	local _abi_release="$(make -C "$_builddir" -s kernelrelease)"
+	local _karch="$(_kernelarch $CARCH | sed 's/x86_64/x86/')"
 	# copy the only the parts that we really need for build 3rd party
 	# kernel modules and install those as /usr/src/linux-headers,
 	# simlar to what ubuntu does
@@ -301,7 +297,7 @@ _dev() {
 	pkgdesc="Headers and script for third party modules for $_flavor kernel"
 	depends="$_depends_dev"
 	local dir="$subpkgdir"/usr/src/linux-headers-"$_abi_release"
-	export KBUILD_BUILD_TIMESTAMP="$(date -Ru${SOURCE_DATE_EPOCH:+d @$SOURCE_DATE_EPOCH})"
+	set_kbuild_timestamp
 
 	# first we import config, run prepare to set up for building
 	# external modules, and create the scripts
@@ -334,9 +330,8 @@ _dev() {
 
 	cp -a scripts include "$dir"
 
-	find "arch/$_karch" -name include -type d -print | while IFS='' read -r folder; do
-		find "$folder" -type f
-	done | sort -u | cpio -pdm "$dir"
+	find "arch/$_karch" "tools/include" "tools/arch/$_karch" -type f -path '*/include/*' \
+		-print | cpio -pdm "$dir"
 
 	install -Dm644 "$srcdir"/build-$_flavor.$CARCH/Module.symvers \
 		"$dir"/Module.symvers
@@ -344,15 +339,8 @@ _dev() {
 	# remove unneeded things
 	msg "Removing documentation..."
 	rm -r "$dir"/Documentation
-	find "$dir" -type f -name '*.o' -printf 'Removing %P\n' -delete
-	local _karch="$(_kernelarch $CARCH | sed 's/x86_64/x86/')"
-	msg "Removing unneeded arch headers..."
-	for i in "$dir"/arch/*; do
-		if [ "${i##*/}" != "$_karch" ]; then
-			echo "  ${i##*/}"
-			rm -r "$i"
-		fi
-	done
+	sed -i -e '/Documentation/d' "$dir"/Kconfig
+	find "$dir" -type f \( -name '*.o' -o -name '*.cmd' \) -exec rm -v -- {} +
 
 	mkdir -p "$subpkgdir"/lib/modules/"$_abi_release"
 	ln -sf /usr/src/linux-headers-"$_abi_release" \
@@ -360,27 +348,25 @@ _dev() {
 }
 
 sha512sums="
-458b2c34d46206f9b4ccbac54cc57aeca1eaecaf831bc441e59701bac6eadffc17f6ce24af6eadd0454964e843186539ac0d63295ad2cc32d112b60360c39a35  linux-6.6.tar.xz
-58bf9e84fb01f811f0cada7f7953d111908f0b0650648d6a3522061fe08c9fe284c9315515ae386189253e37d0c92419f78048d6568e2e426654b1e61010685f  0001-powerpc-boot-wrapper-Add-z-notext-flag-for-ppc64le.patch
-763dcb40f698d43b0bb856f44493973e840b66efe62a8fd41a08b6e3fa38cf903e059d107be3735ab2f38a0f27bdb0262798e5e530a1905f96195cd8bcf62fdf  0002-x86-Compress-vmlinux-with-zstd-19-instead-of-22.patch
-75f232b6becee7d36d360ffaf2aaa837d13518f9ec620ca159bcb2a0e98eb18a77631406a9b44244ea0164a7ed59fad583823909681e9b894a012f9d13365b69  0003-kexec-add-kexec_load_disabled-boot-option.patch
-2956050bb332411d00a285e9656618f2e34b631492bbc19bef54d83a6e91b8531f4e18830b9313cfe52fbf8a8ca6fb76cf55b3ddd146ca3b977046cf2fd10cad  0004-objtool-respect-AWK-setting.patch
-4b16f15b47b5e5835b926126e39723f519290469517875cfb2d2b857a93ad1344f0d1ba4b255289e20f4da9c867647526b344f752981cee0a48c51577badac3f  0005-powerpc-config-defang-gcc-check-for-stack-protector-.patch
-37907a2d1f1421ab48f4b61375be701aee0a235b3ed92655e31c3a79b84ae62daad9e9926096c985cd57680657cffce75d4ea26eabba016c23af95a02ee541af  0006-arm64-add-kernel-config-option-to-lock-down-when.patch
-5403eec3f84b2f39b9ace94ebddb084cbc76c4075f5d023381e9d4af493929661e2c39af559f76cfb4096cfcc6c6997631b53c59fdbb9c772c5627112153b216  0007-efi-add-an-efi_secure_boot-flag-to-indicate-secure-b.patch
-9cf2096086e6a6f8f864c18e5ff1404d5a83dfb53787641c41ecea6558108c205df089dba767201aa2e4df4504b648bf3f5d56150cd18e008ed1e4b9157212f5  0008-efi-lock-down-the-kernel-if-booted-in-secure-boot-mo.patch
-4ee571353d3968de76f38fa03b0553e4165ddd11f742afffa528f946a8a1119761fa40bd4e9fa05d993ac2ea1acee5c6972e330083854e35b66dc7f84aecdcc6  0009-mtd-disable-slram-and-phram-when-locked-down.patch
-b6823197d09f7409c21924dd41e19c38c6ea70f4ca78eb23a7f1b80bb3df6b7f829361bb98e89647e6f60dbc27f0c00aff8af1ded6827728154361395c77f084  lts.aarch64.config
-e076a0faaaa5755eb8edfb3d2449670a3198955a1789a44ccb18273e31d4a67af7062c1e86c809e5756b0387bd7bdbfffdbf59645dc9de4d578752c65f656349  lts.armv7.config
-4a4a6fb8dfc1622233f36cf0926d5ca834b26fd423bda7e240ad44a965185ed9e578b21ac9093d88d2042347c744cdeab9b4d0177c8862b30a69f8b731796d27  lts.loongarch64.config
-2b7d336138925fb6137072c0661e867e8617b584bd218ee07db0857f72c6554a59c3b1cba2d6e7178e5ba403c753b990b105345f052b3fc4c81a91a55fac4d8f  lts.ppc64le.config
-4f6b9dae522aed829c57b95ead8a667fcaab658006b4d5a6dd4bfdce9fcd1512a09438f6369aaff425ec74c740ba20fa72bc017caddd37ee21e7af1d4e007b54  lts.s390x.config
-8be6f02ddeaf870478e834148ec96cc4a9decb9621221010a7e4fdf58598cd8ac761ff5e5c5f0e15cdcaff5dac252c7f9f4f55b5b5c11299631b078c2341d922  lts.x86.config
-d1eee63ff0737c2066136332207fffa3871209a2a1c902405129e70598aaba13285f4838ee0b10ed775057c8d579e8b2d6d437fddfb0205672a6ceb0fa4218c3  lts.x86_64.config
-bb1cf0f9bc30a87156a697935c6474253efb02a321c26c6806258dea50b57b669e5411f165071df3aaed46b05ce1ee01d9c82300fda15018563ef1664a98de29  virt.aarch64.config
-e994035a4cdba0c62a588ac18a2948a1215919c9896088206c2c6bbc28a6375113ab19113cb3c2e5f3df6958b92210a946345378939e11278fc43876f5c142da  virt.armv7.config
-16021f999d0b91e373115ac971be0a613bd6dfeea9f13f54b322eda9991460d70a692584de66da5ea8bdadcd789d059dfd634c0149baec51ebc6ca33d4e842a6  virt.ppc64le.config
-8ef656457521167fa4668f31a06884968a304f4f1a740d9f9e50906ce549d83175805de96ecb1e7739ec317a993c9967d7d26ac7621db4ff5f6e6da8c521ae20  virt.x86.config
-7e8b3b191de163c82957319881704ebd85c523788d2f040813f2c57e16259c8d94dedd9067b22c055aadba958da6e919fd2e3423bb513380c2b6a7103b1c7f45  virt.x86_64.config
-b1267d9ff34f6c4703b64cf5ae8a84417a2e52ba078a71ba8399e98e80255ed3a15c09b9759746d97a49bfb9742e019ac47b93aa053fc8eb54413185ddb398a7  patch-6.6.34.xz
+f7a4999b1f2d2019fcaf691a2c0f1797be73858404fd4825962ec32945733fe98f625d8451d9bc264a1c14500b4596be6b73ea947da35e7b27f044f08642f2ab  patch-6.12.48.patch.xz
+a37b1823df7b4f72542f689b65882634740ba0401a42fdcf6601d9efd2e132e5a7650e70450ba76f6cd1f13ca31180f2ccee9d54fe4df89bc0000ade4380a548  linux-6.12.tar.xz
+b296717ef0cd63978142b4d47b3bc49faa04daf77e115e702ba611cc254a6e782cdab7d5639e724cd5f029cfb6a3dc33c3036f346d681d1fdfe0df723c7e0321  0001-powerpc-boot-wrapper-Add-z-notext-flag-for-ppc64le.patch
+055e10e7b3e00bb3621389315d5206a8feb5022a1f0dc51c3aa107facfe83d191da05a502a0c62488be7299677a63c1da84f87c42cbf3125788c56db67e810ee  0002-x86-Compress-vmlinux-with-zstd-19-instead-of-22.patch
+7e066473fd0e234a279280eee0351bf9c3efab1e7ad0e1a85cb62193e63df06a7641015229445aaab6f68019c4852e6731b2cb3c4a54c0dbe405fac12b365873  0003-kexec-add-kexec_load_disabled-boot-option.patch
+28c83be4c97152001381cd5e3a8acb8552a42d9dac9aaec8f096e3762b7944035aa5a4363fb4602f9bb427c4f72cfd2f996a0a725f7f9e07ab250317985aff9e  0004-objtool-respect-AWK-setting.patch
+5ce79416f8f111c36393718656e3eeb4cb0adccd117dcf661876d1564010e5c58b6351cc4116d187d0a9a838bcca0fecc236d81ac71afb940b89ccb14f21e179  0005-powerpc-config-defang-gcc-check-for-stack-protector-.patch
+26c3f5fcf48cae17a618443df323e51553044286dc9365382c7bd3d2c9a3094930823e155017fbc838f8571449b543596b3febe943118068cfa1b4ee12721698  0007-libbpf-gcc15.patch
+7dbfe2f1e0f5e67b6533710f0bf13a4a67b2a4d68a9361cec6faa494ad9dcbb48a43c9d7946fe7545da310659a5bb917acef86163cb113d9ccaf618c79797268  lts.aarch64.config
+7bb71ea3a59c440003e6f0612919dfc9d7e6796f0af04156a9f79ed516367b23fc1a17c9277ed836ef499f3bacbed3ddedd14a125155ff239e3659c8f0a880b4  lts.armv7.config
+a43d780cf55fef689d9793b10878f38da6cbc2c2d17e85660d59de040d923bae965b089b7c5559c987241d94f2d68dd82f6b97fb62bd2c3054bd103d91ce6a0c  lts.loongarch64.config
+6de644cf1dbca4f133ba377168e8cd836c63b494d08121f1781bd2559cbd16cf065eea194b33c6de9ab8de1c592496065b7776d0bd2d81c0067e032a549b9102  lts.ppc64le.config
+5b7191e6d44f7ff7fa2df4b8179a343caeb101dbcf454f057953105844fa053ad52a77956b8e91679ea816ab4bb20de3b29ea29e2e79fd9edbc3d16c31eb4001  lts.riscv64.config
+99eb4cac2c2c45192aae67870e4f6cc6aa91143f8f3c5c2613ce9fd8ecb7752679f95ad8bb0e379fc98238c193d3ab7909c92509d7026a67fc64a379a2371e2c  lts.s390x.config
+25523fe50ec769ede194f2afc5ec40b1b3f73c0fcc0ab460735a9a16367c21ad12403c20c9927cbfc02c0452e5255fe4074baeb17806fd24d82255ec5690446d  lts.x86.config
+369a18d24f00eea8d660ef2800236b0259ae25af0a8bba2f5f9d66e0e458f0707d3ceecefe966b65d2e5040713ed7337d3ae67061ec2939fe1b0afb2afd47a9c  lts.x86_64.config
+651edc27894198573fc0b45c40ff92e22b6bd7dd1222292b87673ac2fd1fd1874cad2fa092bde7674a31db621f1cb97fd23c1a775756553c108846baaf53ba86  virt.aarch64.config
+9ec36d911153dbb690fa5c461925730e89f2fc4b4d52aeeff0e6b4c99deab6507f4a0a3cb5e7d2961e1bf8d5a7522ea404baad4c36c988bf2adc0a4f70fd8a98  virt.armv7.config
+1ae8ed530c4248233732211e707aa26f6e4d5f9cccdebca7f08631c8d11744585a29033fecccfe7ac3e7c5032291c3a251d75d6e8693b7485762f9744a6e5194  virt.ppc64le.config
+56dc8bae7579c52599bdb3b373570eff3c253c90b8238ed2a3b6a33e7111064760ea5817843607cfa0c515aa57eb15f29694c5186348df88786632edc4dc8188  virt.x86.config
+297a80e1ddc340abc17a18c4b307301fc143a21f7fe977a3ba5f34137eb680d74e7f8d2676e1933d426bb80d3e8c9eae14c1482e9b8907b0a4f47fc25b1ac500  virt.x86_64.config
 "
